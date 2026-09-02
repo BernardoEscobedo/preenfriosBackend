@@ -1,8 +1,21 @@
 import { db } from "../database/connection.database.js";
 
-// Bloque de JOINs reutilizable: desde la ocupación llegamos a la recepción
-// que la originó y de ahí a la producción con todos sus catálogos.
-// Así cada ocupación puede mostrar lote, finca, productor, SKU y cliente.
+// ============================================================================
+// OCUPACIONES DE CÁMARA
+// ============================================================================
+// ALCANCE POR CÁMARA
+//   Las consultas reciben `camaras` desde el middleware cargarAlcance:
+//       null   -> sin restricción (Admin / Coordinador)
+//       [1,2]  -> solo esas cámaras (Supervisor / Operativo)
+//   El patrón `($1::INT[] IS NULL OR id_camara = ANY($1))` sirve para los
+//   dos casos con la misma query, sin SQL dinámico.
+//
+// TRAZABILIDAD
+//   Desde la ocupación se llega a la recepción que la originó y de ahí a la
+//   producción con todos sus catálogos. Así cada fila puede mostrar lote,
+//   finca, productor, SKU y cliente sin duplicar datos.
+// ============================================================================
+
 const SELECT_OCUPACION_DETALLE = `
     SELECT
         o.*,
@@ -57,16 +70,35 @@ const SELECT_OCUPACION_DETALLE = `
     LEFT JOIN mantenimientos m  ON m.id_mantenimiento = o.id_mantenimiento
 `;
 
-// Obtener todas las ocupaciones
-const getOcupaciones = async () => {
+
+// ---------------------------------------------------------
+// CONSULTAS
+// ---------------------------------------------------------
+const getOcupaciones = async (camaras = null) => {
     const result = await db.query(
         `${SELECT_OCUPACION_DETALLE}
-         ORDER BY o.id_ocupacion ASC`
+         WHERE ($1::INT[] IS NULL OR o.id_camara = ANY($1))
+         ORDER BY o.id_ocupacion ASC`,
+        [camaras]
     );
     return result.rows;
 };
 
-// Obtener una ocupación por ID (con todo el detalle del proceso)
+// Ocupaciones activas (estado = 1) con el detalle del proceso
+const getOcupacionesActivas = async (camaras = null) => {
+    const result = await db.query(
+        `${SELECT_OCUPACION_DETALLE}
+         WHERE o.estado = 1
+           AND ($1::INT[] IS NULL OR o.id_camara = ANY($1))
+         ORDER BY o.fecha_inicio DESC, o.hora_inicio DESC`,
+        [camaras]
+    );
+    return result.rows;
+};
+
+// Una ocupación por ID.
+// No filtra por alcance: el controller valida el id_camara del resultado,
+// para poder distinguir entre "no existe" (404) y "no tienes acceso" (403).
 const getOcupacionById = async (id_ocupacion) => {
     const result = await db.query(
         `${SELECT_OCUPACION_DETALLE}
@@ -76,7 +108,6 @@ const getOcupacionById = async (id_ocupacion) => {
     return result.rows[0];
 };
 
-// Obtener ocupaciones por cámara
 const getOcupacionesByCamara = async (id_camara) => {
     const result = await db.query(
         `${SELECT_OCUPACION_DETALLE}
@@ -87,17 +118,10 @@ const getOcupacionesByCamara = async (id_camara) => {
     return result.rows;
 };
 
-// Obtener ocupaciones activas (estado = 1) con detalle del proceso
-const getOcupacionesActivas = async () => {
-    const result = await db.query(
-        `${SELECT_OCUPACION_DETALLE}
-         WHERE o.estado = 1
-         ORDER BY o.fecha_inicio DESC, o.hora_inicio DESC`
-    );
-    return result.rows;
-};
 
-// Crear ocupación
+// ---------------------------------------------------------
+// ALTA / EDICIÓN
+// ---------------------------------------------------------
 const createOcupacion = async ({
     id_camara,
     fecha_inicio,
@@ -135,21 +159,20 @@ const createOcupacion = async ({
             id_camara,
             fecha_inicio,
             hora_inicio,
-            fecha_fin,
-            hora_fin,
+            fecha_fin ?? null,
+            hora_fin ?? null,
             cantidad_tarimas ?? 0,
             cantidad_cajas ?? 0,
             cantidad_bloques ?? 0,
             tipo_ocupacion ?? 1,
-            id_mantenimiento,
-            estado,
-            observaciones
+            id_mantenimiento ?? null,
+            estado ?? 1,
+            observaciones ?? null
         ]
     );
     return result.rows[0];
 };
 
-// Actualizar ocupación
 const updateOcupacion = async (
     id_ocupacion,
     {
@@ -190,22 +213,22 @@ const updateOcupacion = async (
             id_camara,
             fecha_inicio,
             hora_inicio,
-            fecha_fin,
-            hora_fin,
+            fecha_fin ?? null,
+            hora_fin ?? null,
             cantidad_tarimas ?? 0,
             cantidad_cajas ?? 0,
             cantidad_bloques ?? 0,
             tipo_ocupacion ?? 1,
-            id_mantenimiento,
-            estado,
-            observaciones,
+            id_mantenimiento ?? null,
+            estado ?? 1,
+            observaciones ?? null,
             id_ocupacion
         ]
     );
     return result.rows[0];
 };
 
-// Cerrar ocupación (fecha_fin, hora_fin y estado = 0)
+// Cerrar ocupación: fecha_fin, hora_fin y estado = 0
 const cerrarOcupacion = async (id_ocupacion, { fecha_fin, hora_fin }) => {
     const result = await db.query(
         `
@@ -222,7 +245,6 @@ const cerrarOcupacion = async (id_ocupacion, { fecha_fin, hora_fin }) => {
     return result.rows[0];
 };
 
-// Eliminar ocupación
 const deleteOcupacion = async (id_ocupacion) => {
     const result = await db.query(
         `
@@ -235,11 +257,23 @@ const deleteOcupacion = async (id_ocupacion) => {
     return result.rows[0];
 };
 
+// Devuelve solo la cámara de una ocupación.
+// Sirve para validar alcance sin traer todo el detalle.
+const getCamaraDeOcupacion = async (id_ocupacion) => {
+    const result = await db.query(
+        `SELECT id_camara FROM ocupaciones_camaras WHERE id_ocupacion = $1`,
+        [id_ocupacion]
+    );
+    return result.rows[0]?.id_camara ?? null;
+};
+
+
 const ocupacionesModel = {
     getOcupaciones,
     getOcupacionById,
     getOcupacionesByCamara,
     getOcupacionesActivas,
+    getCamaraDeOcupacion,
     createOcupacion,
     updateOcupacion,
     cerrarOcupacion,

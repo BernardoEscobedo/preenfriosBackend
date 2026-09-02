@@ -1,41 +1,81 @@
 import { db } from "../database/connection.database.js";
 
-// =========================================================
+// ============================================================================
+// RECEPCIONES
+// ============================================================================
+// ALCANCE POR CÁMARA
+//   Todas las consultas reciben `camaras`, que llega desde el middleware
+//   cargarAlcance:
+//       null   -> sin restricción (Admin / Coordinador)
+//       [1,2]  -> solo esas cámaras (Supervisor / Operativo)
+//       []     -> no ve nada (usuario sin asignación)
+//
+//   El patrón `($1::INT[] IS NULL OR id_camara = ANY($1))` permite usar la
+//   MISMA query para los dos casos, sin armar SQL dinámico ni duplicar
+//   métodos. Si el parámetro es NULL la condición se cumple siempre.
+//
+//   El filtro va aquí y no en el frontend: ocultar cámaras en la vista no
+//   protege nada, porque con el token se puede llamar la API directo.
+// ============================================================================
+
+
+// ---------------------------------------------------------
 // RECEPCIONES ESPERADAS (vista)
-// =========================================================
-const getRecepcionesEsperadas = async () => {
-    const result = await db.query(
-        `SELECT * FROM vw_recepciones_esperadas ORDER BY id_produccion DESC`
-    );
-    return result.rows;
-};
-
-const getRecepcionesEsperadasBySemana = async (semana) => {
-    const result = await db.query(
-        `SELECT * FROM vw_recepciones_esperadas WHERE semana = $1
-         ORDER BY id_produccion DESC`,
-        [semana]
-    );
-    return result.rows;
-};
-
-const getPendientes = async () => {
+// ---------------------------------------------------------
+// Las producciones con id_camara NULL van directo a CEDA: no pasan por
+// ninguna cámara, así que NO se muestran a quien tiene alcance limitado.
+// No son asunto del preenfrío.
+const getRecepcionesEsperadas = async (camaras = null) => {
     const result = await db.query(
         `
         SELECT * FROM vw_recepciones_esperadas
-        WHERE cajas_pendientes > 0 AND se_preenfria = TRUE
-        ORDER BY fecha_entrega ASC NULLS LAST, id_produccion DESC
-        `
+        WHERE ($1::INT[] IS NULL OR id_camara = ANY($1))
+        ORDER BY id_produccion DESC
+        `,
+        [camaras]
     );
     return result.rows;
 };
 
-// =========================================================
-// DISPONIBILIDAD (para sugerir la división al recepcionar)
-// =========================================================
-const getDisponibilidadCamaras = async () => {
+const getRecepcionesEsperadasBySemana = async (semana, camaras = null) => {
     const result = await db.query(
-        `SELECT * FROM vw_disponibilidad_camaras ORDER BY id_camara ASC`
+        `
+        SELECT * FROM vw_recepciones_esperadas
+        WHERE semana = $1
+          AND ($2::INT[] IS NULL OR id_camara = ANY($2))
+        ORDER BY id_produccion DESC
+        `,
+        [semana, camaras]
+    );
+    return result.rows;
+};
+
+const getPendientes = async (camaras = null) => {
+    const result = await db.query(
+        `
+        SELECT * FROM vw_recepciones_esperadas
+        WHERE cajas_pendientes > 0
+          AND se_preenfria = TRUE
+          AND ($1::INT[] IS NULL OR id_camara = ANY($1))
+        ORDER BY fecha_entrega ASC NULLS LAST, id_produccion DESC
+        `,
+        [camaras]
+    );
+    return result.rows;
+};
+
+
+// ---------------------------------------------------------
+// DISPONIBILIDAD (para sugerir la división al recepcionar)
+// ---------------------------------------------------------
+const getDisponibilidadCamaras = async (camaras = null) => {
+    const result = await db.query(
+        `
+        SELECT * FROM vw_disponibilidad_camaras
+        WHERE ($1::INT[] IS NULL OR id_camara = ANY($1))
+        ORDER BY id_camara ASC
+        `,
+        [camaras]
     );
     return result.rows;
 };
@@ -48,14 +88,21 @@ const getTarimasDisponibles = async (id_camara) => {
     return result.rows[0]?.disponibles ?? 0;
 };
 
-// =========================================================
+
+// ---------------------------------------------------------
 // COLA DE ESPERA
-// =========================================================
+// ---------------------------------------------------------
 // La vista ya viene ordenada por:
 //   prioridad DESC -> fecha_empaque ASC -> llegada ASC
 // (la fruta más vieja entra primero, salvo que se marque urgente)
-const getColaEspera = async () => {
-    const result = await db.query(`SELECT * FROM vw_cola_espera`);
+const getColaEspera = async (camaras = null) => {
+    const result = await db.query(
+        `
+        SELECT * FROM vw_cola_espera
+        WHERE ($1::INT[] IS NULL OR id_camara = ANY($1))
+        `,
+        [camaras]
+    );
     return result.rows;
 };
 
@@ -92,10 +139,23 @@ const setPrioridadCola = async (id_ocupacion, prioridad, motivo) => {
     return result.rows[0]?.resultado;
 };
 
-// =========================================================
+// Devuelve la cámara de una fila de la cola.
+// Se usa para validar que el usuario tenga acceso antes de promoverla:
+// sin esto, alguien podría ingresar producto de una cámara ajena
+// mandando el id_ocupacion a mano.
+const getCamaraDeOcupacion = async (id_ocupacion) => {
+    const result = await db.query(
+        `SELECT id_camara FROM ocupaciones_camaras WHERE id_ocupacion = $1`,
+        [id_ocupacion]
+    );
+    return result.rows[0]?.id_camara ?? null;
+};
+
+
+// ---------------------------------------------------------
 // RECEPCIONES (registros reales)
-// =========================================================
-const getRecepciones = async () => {
+// ---------------------------------------------------------
+const getRecepciones = async (camaras = null) => {
     const result = await db.query(
         `
         SELECT
@@ -120,8 +180,10 @@ const getRecepciones = async () => {
         LEFT JOIN camaras   cam ON cam.id_camara   = r.id_camara
         LEFT JOIN usuarios  u   ON u.id_usuario    = r.id_usuario
         LEFT JOIN empleados e   ON e.id_empleado   = u.id_empleado
+        WHERE ($1::INT[] IS NULL OR r.id_camara = ANY($1))
         ORDER BY r.id_recepcion DESC
-        `
+        `,
+        [camaras]
     );
     return result.rows;
 };
@@ -169,6 +231,9 @@ const getRecepcionesByProduccion = async (id_produccion) => {
     return result.rows;
 };
 
+// Crear recepción.
+// El trigger fn_sync_ocupacion_recepcion usa tarimas_ingresadas para saber
+// cuánto entra a la cámara; el resto se va a la cola (tipo_ocupacion = 3).
 const createRecepcion = async ({
     id_produccion,
     id_camara,
@@ -201,6 +266,7 @@ const createRecepcion = async ({
             hora_recepcion,
             cajas_recibidas ?? 0,
             tarimas_recibidas ?? 0,
+            // NULL => el trigger calcula automáticamente lo que cabe
             tarimas_ingresadas ?? null,
             cajas_ingresadas ?? null,
             temperatura ?? null,
@@ -270,6 +336,7 @@ const deleteRecepcion = async (id_recepcion) => {
     return result.rows[0];
 };
 
+
 const recepcionesModel = {
     getRecepcionesEsperadas,
     getRecepcionesEsperadasBySemana,
@@ -280,6 +347,7 @@ const recepcionesModel = {
     getColaEsperaByCamara,
     promoverDeCola,
     setPrioridadCola,
+    getCamaraDeOcupacion,
     getRecepciones,
     getRecepcionById,
     getRecepcionesByProduccion,
