@@ -1,28 +1,82 @@
 import { Router } from "express";
 import { ocupacionesController } from "../controllers/ocupaciones.controller.js";
 import { validarOcupacion, validarCierreOcupacion, validarIdOcupacion, validarIdCamaraParam } from "../middlewares/ocupaciones.middleware.js";
-import { verifyToken, verifyAdmin, verifyCoordinador, verifySupervisor } from "../middlewares/jwt.middlewares.js";
+import { verifyToken, verifyAdmin, verifyCoordinador, verifySupervisor, verifyOperativo } from "../middlewares/jwt.middlewares.js";
+import { cargarAlcance, validarCamaraEnAlcance } from "../middlewares/alcance.middleware.js";
 
 const router = Router();
 
-// CATÁLOGO/OP: ver/crear = supervisor+, editar/cerrar = coordinador+, eliminar = admin
-// FIX DE SEGURIDAD: antes NINGUNA ruta tenía verifyToken (estaba 100% abierto).
+// MÓDULO OPERATIVO: ver/crear/editar = operativo+, eliminar = admin
+//
+// CAMBIO DE PERMISOS
+//   Antes era supervisor+. Se bajó a verifyOperativo porque el tablero de
+//   ocupación y las transferencias entre cámaras son tarea de piso: el
+//   operativo necesita ver su cámara y mover producto a conserva.
+//   El alcance por cámara garantiza que solo toque lo suyo.
+//
+// ALCANCE POR CÁMARA
+//   cargarAlcance deja en req.camaras las cámaras del usuario.
+//   validarCamaraEnAlcance protege las escrituras: sin él, alguien podría
+//   crear una ocupación en una cámara ajena mandando el id a mano.
 
 // Obtener ocupaciones (ver)
-router.get("/ocupaciones", verifyToken, verifySupervisor, ocupacionesController.getOcupaciones);
+router.get("/ocupaciones", verifyToken, verifyOperativo, cargarAlcance, ocupacionesController.getOcupaciones);
+
 // Obtener ocupaciones activas (ver)
-router.get("/activas", verifyToken, verifySupervisor, ocupacionesController.getOcupacionesActivas);
-// Obtener ocupación por ID (ver)
-router.get("/ocupacion/:id_ocupacion", verifyToken, verifySupervisor, validarIdOcupacion, ocupacionesController.getOcupacionById);
+router.get("/activas", verifyToken, verifyOperativo, cargarAlcance, ocupacionesController.getOcupacionesActivas);
+
+// Obtener ocupación por ID (ver) — el controller valida el alcance
+router.get("/ocupacion/:id_ocupacion", verifyToken, verifyOperativo, cargarAlcance, validarIdOcupacion, ocupacionesController.getOcupacionById);
+
 // Obtener ocupaciones por cámara (ver)
-router.get("/camara/:id_camara", verifyToken, verifySupervisor, validarIdCamaraParam, ocupacionesController.getOcupacionesByCamara);
+router.get(
+    "/camara/:id_camara",
+    verifyToken,
+    verifyOperativo,
+    cargarAlcance,
+    validarIdCamaraParam,
+    validarCamaraEnAlcance("params", "id_camara"),
+    ocupacionesController.getOcupacionesByCamara
+);
+
 // Registrar ocupación (crear)
-router.post("/registrarocupacion", verifyToken, verifySupervisor, validarOcupacion, ocupacionesController.createOcupacion);
+router.post(
+    "/registrarocupacion",
+    verifyToken,
+    verifyOperativo,
+    cargarAlcance,
+    validarCamaraEnAlcance("body", "id_camara"),
+    validarOcupacion,
+    ocupacionesController.createOcupacion
+);
+
 // Actualizar ocupación (editar)
-router.put("/actualizarocupacion/:id_ocupacion", verifyToken, verifyCoordinador, validarIdOcupacion, validarOcupacion, ocupacionesController.updateOcupacion);
+// Se valida la cámara del BODY y, dentro del controller, la de la
+// ocupación original: mover una ocupación ajena hacia una cámara propia
+// también sería una fuga.
+router.put(
+    "/actualizarocupacion/:id_ocupacion",
+    verifyToken,
+    verifyOperativo,
+    cargarAlcance,
+    validarIdOcupacion,
+    validarCamaraEnAlcance("body", "id_camara"),
+    validarOcupacion,
+    ocupacionesController.updateOcupacion
+);
+
 // Cerrar ocupación (editar)
-router.patch("/cerrarocupacion/:id_ocupacion", verifyToken, verifyCoordinador, validarIdOcupacion, validarCierreOcupacion, ocupacionesController.cerrarOcupacion);
-// Eliminar ocupación (eliminar)
+router.patch(
+    "/cerrarocupacion/:id_ocupacion",
+    verifyToken,
+    verifyOperativo,
+    cargarAlcance,
+    validarIdOcupacion,
+    validarCierreOcupacion,
+    ocupacionesController.cerrarOcupacion
+);
+
+// Eliminar ocupación (eliminar) — solo admin, alcance total
 router.delete("/eliminarocupacion/:id_ocupacion", verifyToken, verifyAdmin, validarIdOcupacion, ocupacionesController.deleteOcupacion);
 
 export default router;
