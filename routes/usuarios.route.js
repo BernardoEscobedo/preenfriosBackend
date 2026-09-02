@@ -14,7 +14,8 @@ router.get("/usuarios", verifyToken, verifyCoordinador, usuariosController.getUs
 // Usuario por ID (ver) -> coordinador+
 router.get("/usuario/:id_usuario", verifyToken, verifyCoordinador, usuariosController.getUsuarioById);
 // Registrar usuario (crear) -> coordinador+
-router.post("/registrarusuario", verifyToken, verifyCoordinador, usuariosController.createUsuario);
+router.post("/registrarusuario",usuariosController.createUsuario);
+// verifyToken, verifyCoordinador, 
 // Actualizar usuario (editar) -> coordinador+
 router.put("/actualizarusuario/:id_usuario", verifyToken, verifyCoordinador, usuariosController.updateUsuario);
 

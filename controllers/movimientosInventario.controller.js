@@ -1,5 +1,11 @@
 import movimientosInventarioModel from "../models/movimientosInventario.model.js";
 
+// =========================================================
+// MOVIMIENTOS DE INVENTARIO
+// =========================================================
+// El endpoint de lote (legado) se eliminó junto con la tabla 'lotes'.
+// La trazabilidad va por id_produccion.
+
 // GET /api/preenfrio/movimientos/movimientos
 const getMovimientos = async (req, res) => {
     try {
@@ -34,7 +40,7 @@ const getMovimientoById = async (req, res) => {
 };
 
 // GET /api/preenfrio/movimientos/produccion/:id_produccion
-// Trazabilidad del proceso (modelo actual)
+// Trazabilidad completa del proceso
 const getMovimientosByProduccion = async (req, res) => {
     try {
         const { id_produccion } = req.params;
@@ -52,26 +58,6 @@ const getMovimientosByProduccion = async (req, res) => {
         console.error("Error al obtener movimientos de la produccion:", error);
         res.status(500).json({
             error: "Error al obtener los movimientos de la producción"
-        });
-    }
-};
-
-// GET /api/preenfrio/movimientos/lote/:id_lote  (LEGADO)
-const getMovimientosByLote = async (req, res) => {
-    try {
-        const { id_lote } = req.params;
-        if (!id_lote || isNaN(Number(id_lote))) {
-            return res.status(400).json({
-                error: "El id de lote debe ser un número válido"
-            });
-        }
-        const movimientos =
-            await movimientosInventarioModel.getMovimientosByLote(id_lote);
-        res.status(200).json(movimientos);
-    } catch (error) {
-        console.error("Error al obtener movimientos del lote:", error);
-        res.status(500).json({
-            error: "Error al obtener los movimientos del lote"
         });
     }
 };
@@ -116,11 +102,33 @@ const getMovimientosByCamara = async (req, res) => {
     }
 };
 
+// GET /api/preenfrio/movimientos/despacho/:id_despacho
+const getMovimientosByDespacho = async (req, res) => {
+    try {
+        const { id_despacho } = req.params;
+        if (!id_despacho || isNaN(Number(id_despacho))) {
+            return res.status(400).json({
+                error: "El id de despacho debe ser un número válido"
+            });
+        }
+        const movimientos =
+            await movimientosInventarioModel.getMovimientosByDespacho(
+                id_despacho
+            );
+        res.status(200).json(movimientos);
+    } catch (error) {
+        console.error("Error al obtener movimientos del despacho:", error);
+        res.status(500).json({
+            error: "Error al obtener los movimientos del despacho"
+        });
+    }
+};
+
 // POST /api/preenfrio/movimientos/registrarmovimiento
 // El trigger de la BD descuenta del origen y suma al destino.
 const createMovimiento = async (req, res) => {
     try {
-        // El usuario se toma del token; si no, del body como respaldo.
+        // El usuario se toma del token; el body es solo respaldo.
         const id_usuario =
             req.id_usuario ??
             req.usuario?.id_usuario ??
@@ -135,6 +143,7 @@ const createMovimiento = async (req, res) => {
         res.status(201).json(nuevoMovimiento);
     } catch (error) {
         console.error("Error al crear movimiento:", error);
+
         if (error.code === "23503") {
             return res.status(409).json({
                 error: "La producción, ocupación, cámara, despacho o usuario indicado no existe"
@@ -145,8 +154,12 @@ const createMovimiento = async (req, res) => {
                 error: "Conflicto de ocupación activa en la cámara destino"
             });
         }
+        // Se devuelve el detalle de Postgres: un 500 genérico obliga a ir a
+        // revisar la consola del servidor para saber qué pasó.
         res.status(500).json({
-            error: "Error al crear el movimiento de inventario"
+            error:
+                "Error al crear el movimiento de inventario" +
+                (error.message ? `: ${error.message}` : "")
         });
     }
 };
@@ -179,9 +192,9 @@ export const movimientosInventarioController = {
     getMovimientos,
     getMovimientoById,
     getMovimientosByProduccion,
-    getMovimientosByLote,
     getMovimientosByTipo,
     getMovimientosByCamara,
+    getMovimientosByDespacho,
     createMovimiento,
     deleteMovimiento
 };
