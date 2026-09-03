@@ -1,15 +1,30 @@
 import movimientosInventarioModel from "../models/movimientosInventario.model.js";
 
-// =========================================================
+// ============================================================================
 // MOVIMIENTOS DE INVENTARIO
-// =========================================================
+// ============================================================================
+// ALCANCE POR CÁMARA
+//   req.camaras lo pone el middleware cargarAlcance:
+//       null  -> Admin / Coordinador (ven todo)
+//       [...] -> Supervisor / Operativo (solo sus cámaras)
+//
+//   Un movimiento toca DOS cámaras: basta con que una esté en el alcance
+//   para poder verlo. Para CREAR, en cambio, se exige que el ORIGEN sea
+//   suyo: nadie debe sacar fruta de una cámara ajena.
+//
 // El endpoint de lote (legado) se eliminó junto con la tabla 'lotes'.
 // La trazabilidad va por id_produccion.
+// ============================================================================
+
+const sinAcceso = (req, id_camara) =>
+    Array.isArray(req.camaras) && !req.camaras.includes(Number(id_camara));
 
 // GET /api/preenfrio/movimientos/movimientos
 const getMovimientos = async (req, res) => {
     try {
-        const movimientos = await movimientosInventarioModel.getMovimientos();
+        const movimientos = await movimientosInventarioModel.getMovimientos(
+            req.camaras
+        );
         res.status(200).json(movimientos);
     } catch (error) {
         console.error("Error al obtener movimientos:", error);
@@ -25,11 +40,29 @@ const getMovimientoById = async (req, res) => {
         const { id } = req.params;
         const movimiento =
             await movimientosInventarioModel.getMovimientoById(id);
+
         if (!movimiento) {
             return res.status(404).json({
                 error: "Movimiento no encontrado"
             });
         }
+
+        // Basta con que una de las dos cámaras esté en su alcance
+        if (Array.isArray(req.camaras)) {
+            const veOrigen =
+                movimiento.id_camara_origen !== null &&
+                req.camaras.includes(Number(movimiento.id_camara_origen));
+            const veDestino =
+                movimiento.id_camara_destino !== null &&
+                req.camaras.includes(Number(movimiento.id_camara_destino));
+
+            if (!veOrigen && !veDestino) {
+                return res.status(403).json({
+                    error: "No tienes acceso a ese movimiento"
+                });
+            }
+        }
+
         res.status(200).json(movimiento);
     } catch (error) {
         console.error("Error al obtener movimiento:", error);
@@ -51,7 +84,8 @@ const getMovimientosByProduccion = async (req, res) => {
         }
         const movimientos =
             await movimientosInventarioModel.getMovimientosByProduccion(
-                id_produccion
+                id_produccion,
+                req.camaras
             );
         res.status(200).json(movimientos);
     } catch (error) {
@@ -72,7 +106,10 @@ const getMovimientosByTipo = async (req, res) => {
             });
         }
         const movimientos =
-            await movimientosInventarioModel.getMovimientosByTipo(tipo);
+            await movimientosInventarioModel.getMovimientosByTipo(
+                tipo,
+                req.camaras
+            );
         res.status(200).json(movimientos);
     } catch (error) {
         console.error("Error al obtener movimientos por tipo:", error);
@@ -83,6 +120,7 @@ const getMovimientosByTipo = async (req, res) => {
 };
 
 // GET /api/preenfrio/movimientos/camara/:id_camara
+// El alcance lo valida validarCamaraEnAlcance en la ruta.
 const getMovimientosByCamara = async (req, res) => {
     try {
         const { id_camara } = req.params;
@@ -113,7 +151,8 @@ const getMovimientosByDespacho = async (req, res) => {
         }
         const movimientos =
             await movimientosInventarioModel.getMovimientosByDespacho(
-                id_despacho
+                id_despacho,
+                req.camaras
             );
         res.status(200).json(movimientos);
     } catch (error) {
@@ -126,8 +165,35 @@ const getMovimientosByDespacho = async (req, res) => {
 
 // POST /api/preenfrio/movimientos/registrarmovimiento
 // El trigger de la BD descuenta del origen y suma al destino.
+//
+// ALCANCE: se valida el ORIGEN aquí porque el body puede traer solo
+// id_ocupacion_origen (sin id_camara_origen). El destino se valida en la
+// ruta con validarCamaraEnAlcance, cuando viene explícito.
 const createMovimiento = async (req, res) => {
     try {
+        const { id_ocupacion_origen, id_camara_origen } = req.body;
+
+        if (Array.isArray(req.camaras)) {
+            let camOrigen = id_camara_origen;
+
+            // Si no vino la cámara, se resuelve desde la ocupación
+            if (
+                (camOrigen === undefined || camOrigen === null || camOrigen === "") &&
+                id_ocupacion_origen
+            ) {
+                camOrigen =
+                    await movimientosInventarioModel.getCamaraDeOcupacion(
+                        Number(id_ocupacion_origen)
+                    );
+            }
+
+            if (camOrigen && sinAcceso(req, camOrigen)) {
+                return res.status(403).json({
+                    error: "No tienes acceso a la cámara de origen"
+                });
+            }
+        }
+
         // El usuario se toma del token; el body es solo respaldo.
         const id_usuario =
             req.id_usuario ??
@@ -154,7 +220,7 @@ const createMovimiento = async (req, res) => {
                 error: "Conflicto de ocupación activa en la cámara destino"
             });
         }
-        // Se devuelve el detalle de Postgres: un 500 genérico obliga a ir a
+        // Se devuelve el detalle de Postgres: un 500 mudo obliga a ir a
         // revisar la consola del servidor para saber qué pasó.
         res.status(500).json({
             error:
@@ -182,6 +248,11 @@ const deleteMovimiento = async (req, res) => {
         });
     } catch (error) {
         console.error("Error al eliminar movimiento:", error);
+        if (error.code === "23503") {
+            return res.status(409).json({
+                error: "No se puede eliminar: el movimiento está referenciado en un despacho"
+            });
+        }
         res.status(500).json({
             error: "Error al eliminar el movimiento"
         });

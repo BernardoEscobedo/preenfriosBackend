@@ -6,6 +6,7 @@ import {
     validarIdDespacho,
     validarIdDetalle
 } from "../middlewares/despachos.middleware.js";
+import { cargarAlcance } from "../middlewares/alcance.middleware.js";
 import {
     verifyToken,
     verifyAdmin,
@@ -13,106 +14,91 @@ import {
     verifySupervisor,
     verifyOperativo
 } from "../middlewares/jwt.middlewares.js";
-import { evidenciasController } from "../controllers/evidenciasDespacho.controller.js";
-import { uploadMemoria, manejarErrorUpload } from "../middlewares/upload.middleware.js";
 
 const router = Router();
 
 // Módulo OPERATIVO (despachos)
 //   ver/crear/armar picking = operativo+
-//   cerrar/cancelar/editar  = coordinador+
+//   cerrar/editar           = coordinador+
 //   eliminar                = admin
 //
-// Se conservan todas las rutas originales; las nuevas quedan marcadas.
+// ALCANCE POR CÁMARA
+//   cargarAlcance deja en req.camaras las cámaras del usuario.
+//   Se aplica al INVENTARIO (de dónde se toma la fruta) y a las escrituras
+//   sobre el picking. La lista de despachos NO se filtra: un despacho es un
+//   documento comercial que puede llevar carga de varias plantas.
+//
+//   Las validaciones de alcance del picking van dentro del controller,
+//   porque el body suele traer id_ocupacion_origen y hay que resolver
+//   primero a qué cámara pertenece.
 
 // ============================================================
-// INVENTARIO DISPONIBLE   ⭐ nuevo
+// INVENTARIO DISPONIBLE
 // ============================================================
-// Todo lo que hay en cámaras (preenfrío y conserva), ordenado FEFO
-// (fruta más vieja primero). Es la fuente del picking.
-router.get("/inventario", verifyToken, verifyOperativo, despachosController.getInventarioDisponible);
-router.get("/inventario/cliente/:id_cc", verifyToken, verifyOperativo, despachosController.getInventarioByCliente);
+// Todo lo que hay en SUS cámaras, ordenado FEFO (fruta más vieja primero).
+router.get("/inventario", verifyToken, verifyOperativo, cargarAlcance, despachosController.getInventarioDisponible);
+router.get("/inventario/cliente/:id_cc", verifyToken, verifyOperativo, cargarAlcance, despachosController.getInventarioByCliente);
+
+// Clientes que tienen fruta disponible EN SUS CÁMARAS (dropdown del alta)
+router.get("/clientes", verifyToken, verifyOperativo, cargarAlcance, despachosController.getClientesConInventario);
 
 // ============================================================
 // CONSULTAS
 // ============================================================
-// GET todos (ver)
 router.get("/despachos", verifyToken, verifyOperativo, despachosController.getDespachos);
 
-// Folio automático (D-AAAA-NNNN)   ⭐ nuevo
+// Folio automático (numeración desde 70000)
 // OJO: consume la secuencia; llamar solo al abrir el modal de alta.
 router.get("/siguientefolio", verifyToken, verifyOperativo, despachosController.getSiguienteFolio);
 
-// Por estado: 1=borrador · 2=cerrado · 0=cancelado   ⭐ nuevo
+// Por estado: 1=borrador · 2=cerrado
 router.get("/estado/:estado", verifyToken, verifyOperativo, despachosController.getDespachosByEstado);
 
-// Picking list para impresión (encabezado + líneas)   ⭐ nuevo
+// Picking list para impresión (encabezado + líneas)
 router.get("/pickinglist/:id", verifyToken, verifyOperativo, validarIdDespacho, despachosController.getPickingList);
 
-// GET encabezado por id (ver)
+// Historial de correcciones sobre el despacho
+router.get("/auditoria/:id_despacho", verifyToken, verifyOperativo, despachosController.getAuditoria);
+
+// Encabezado por id
 router.get("/despacho/:id", verifyToken, verifyOperativo, validarIdDespacho, despachosController.getDespachoById);
 
-// GET encabezado + detalle (ver)
+// Encabezado + detalle
 router.get("/despacho/:id/detalle", verifyToken, verifyOperativo, validarIdDespacho, despachosController.getDespachoConDetalle);
 
 // ============================================================
 // ALTAS
 // ============================================================
-// POST crear despacho (crear)
-// El folio se autogenera; el transporte es obligatorio.
-router.post("/registrardespacho", verifyToken, verifyOperativo, validarDespacho, despachosController.createDespacho);
+// Crear despacho. El folio se autogenera; el transporte es obligatorio.
+// Si viene con detalle, el controller valida que todas las líneas salgan
+// de cámaras propias.
+router.post("/registrardespacho", verifyToken, verifyOperativo, cargarAlcance, validarDespacho, despachosController.createDespacho);
 
-// POST agregar línea de detalle (armar picking)
+// Agregar línea al picking.
 // Genera un movimiento tipo 3 que descuenta la cámara de origen.
-router.post("/despacho/:id/detalle", verifyToken, verifyOperativo, validarIdDespacho, validarDetalle, despachosController.addDetalle);
+router.post("/despacho/:id/detalle", verifyToken, verifyOperativo, cargarAlcance, validarIdDespacho, validarDetalle, despachosController.addDetalle);
 
 // ============================================================
 // EDICIÓN Y CAMBIOS DE ESTADO
 // ============================================================
-// PUT actualizar encabezado (editar)
+// Actualizar encabezado.
+// Si el despacho está CERRADO, el controller exige motivo_edicion y solo
+// permite corregir datos administrativos (queda en la bitácora).
 router.put("/actualizardespacho/:id", verifyToken, verifyOperativo, validarIdDespacho, validarDespacho, despachosController.updateDespacho);
 
-// PATCH cerrar despacho (estado 2) — congela el picking   ⭐ nuevo
+// Cerrar despacho (estado 2) — congela el picking
 router.patch("/cerrardespacho/:id", verifyToken, verifyCoordinador, validarIdDespacho, despachosController.cerrarDespacho);
-
-// PATCH cancelar despacho (estado 0)   ⭐ nuevo
-router.patch("/cancelardespacho/:id", verifyToken, verifyCoordinador, validarIdDespacho, despachosController.cancelarDespacho);
 
 // ============================================================
 // BAJAS
 // ============================================================
-// DELETE una línea del picking.
-// Devuelve el producto a la cámara y borra su movimiento.
-// NOTA: antes era verifyAdmin. Se bajó a verifyOperativo porque quitar una
-// línea de un borrador es una corrección normal de captura. Si prefieres
-// restringirlo, cambia a verifyCoordinador o verifyAdmin.
-router.delete("/detalle/:id_detalle", verifyToken, verifyCoordinador, validarIdDetalle, despachosController.deleteDetalle);
+// Quitar una línea del picking: devuelve el producto a la cámara y borra
+// su movimiento. Es una corrección normal de captura sobre un borrador,
+// por eso queda en verifyOperativo.
+router.delete("/detalle/:id_detalle", verifyToken, verifyOperativo, cargarAlcance, validarIdDetalle, despachosController.deleteDetalle);
 
-// DELETE despacho completo (eliminar)
-// Devuelve a las cámaras el producto de todas sus líneas antes de borrar.
+// Eliminar despacho completo. Solo borradores: devuelve a las cámaras el
+// producto de todas sus líneas antes de borrar.
 router.delete("/eliminardespacho/:id", verifyToken, verifyAdmin, validarIdDespacho, despachosController.deleteDespacho);
-
-// Clientes que tienen fruta disponible (dropdown del despacho)
-router.get("/clientes", verifyToken, verifyOperativo, despachosController.getClientesConInventario);
-
-// ============================================================
-// EVIDENCIAS FOTOGRÁFICAS (máx. 3 por despacho)
-// Para respaldar reclamos: no se imprimen en el picking list.
-// ============================================================
-router.get("/evidencias/:id_despacho", verifyToken, verifyOperativo, evidenciasController.getEvidencias);
-
-// multipart/form-data → campo "foto"
-router.post(
-    "/evidencias/:id_despacho",
-    verifyToken,
-    verifyOperativo,
-    uploadMemoria.single("foto"),
-    manejarErrorUpload,
-    evidenciasController.subirEvidencia
-);
-
-router.delete("/evidencias/:id_evidencia", verifyToken, verifyCoordinador, evidenciasController.eliminarEvidencia);
-
-router.get("/auditoria/:id_despacho", verifyToken, verifyOperativo, despachosController.getAuditoria);
 
 export default router;

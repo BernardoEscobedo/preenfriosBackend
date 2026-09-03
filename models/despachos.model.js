@@ -1,35 +1,34 @@
 import { db } from "../database/connection.database.js";
 
-// =========================================================
-// NOTA DE DISEÑO  (actualizada tras la migración de despachos)
-// =========================================================
+// ============================================================================
+// DESPACHOS
+// ============================================================================
 // TOTALES
 //   despachos.cantidad_tarimas / cantidad_cajas los recalcula el TRIGGER
-//   trg_recalcular_totales_despacho a partir de despachos_detalle.
-//   Ya NO se recalculan a mano desde este modelo (se eliminó
-//   recalcularTotales para no duplicar trabajo).
+//   trg_recalcular_totales_despacho desde despachos_detalle. No se tocan
+//   a mano desde este modelo.
 //
 // DESCUENTO DE INVENTARIO
 //   Al insertar una línea en despachos_detalle, el trigger
 //   trg_despacho_detalle_movimiento genera un movimientos_inventario
-//   tipo=3 (salida_despacho), y ES ESE movimiento el que descuenta la
-//   ocupación de la cámara. Nunca se toca ocupaciones_camaras desde aquí:
-//   una sola vía de descuento evita descuadres por doble conteo.
+//   tipo=3, y ES ESE movimiento el que descuenta la ocupación. Nunca se
+//   toca ocupaciones_camaras desde aquí: una sola vía de descuento evita
+//   descuadres por doble conteo.
 //
-// TRAZABILIDAD
-//   El detalle se liga a id_produccion + id_ocupacion_origen.
-//   id_lote quedó como LEGADO (el módulo de lotes se dio de baja), por eso
-//   los JOIN a 'lotes' son LEFT JOIN: un INNER ocultaría todas las líneas
-//   nuevas.
+// ESTADOS
+//   1 = borrador (armando el picking) · 2 = cerrado (ya salió)
+//   No existe "cancelado": marcarlo sin revertir inventario generaba
+//   descuadres silenciosos.
 //
-// ESTADOS DEL DESPACHO
-//   1 = borrador (se está armando el picking)
-//   2 = cerrado  (ya salió; no se edita)
-//   0 = cancelado
-//
-// FOLIO
-//   Se autogenera en la BD con fn_generar_folio_despacho() → D-AAAA-NNNN.
-// =========================================================
+// ALCANCE POR CÁMARA
+//   El INVENTARIO se filtra siempre: un supervisor solo puede despachar
+//   fruta de sus cámaras.
+//   Los DESPACHOS (el documento) no se filtran por defecto: un despacho es
+//   un documento comercial que puede llevar fruta de varias plantas, y
+//   recortarlo daría totales incompletos. Lo que sí queda acotado es de
+//   dónde puede tomar producto cada quien, que es lo que protege el
+//   inventario.
+// ============================================================================
 
 
 // ---------------------------------------------------------
@@ -37,26 +36,61 @@ import { db } from "../database/connection.database.js";
 // ---------------------------------------------------------
 // Todo lo que hay físicamente en cámaras (preenfrío y conserva),
 // ordenado por fruta más vieja primero (FEFO).
-const getInventarioDisponible = async () => {
-    const result = await db.query(`SELECT * FROM vw_inventario_disponible`);
-    return result.rows;
-};
-
-// Mismo inventario, filtrado por el cliente al que estaba destinado.
-// El frontend muestra TODO, pero este endpoint queda disponible.
-const getInventarioByCliente = async (id_cc) => {
+const getInventarioDisponible = async (camaras = null) => {
     const result = await db.query(
-        `SELECT * FROM vw_inventario_disponible WHERE id_cc = $1`,
-        [id_cc]
+        `
+        SELECT * FROM vw_inventario_disponible
+        WHERE ($1::INT[] IS NULL OR id_camara = ANY($1))
+        `,
+        [camaras]
     );
     return result.rows;
 };
 
-// Alimenta el dropdown del despacho: evita ofrecer clientes sin inventario.
-const getClientesConInventario = async () => {
-    const result = await db.query(`SELECT * FROM vw_clientes_con_inventario`);
+// Mismo inventario, filtrado por el cliente al que estaba destinado.
+const getInventarioByCliente = async (id_cc, camaras = null) => {
+    const result = await db.query(
+        `
+        SELECT * FROM vw_inventario_disponible
+        WHERE id_cc = $1
+          AND ($2::INT[] IS NULL OR id_camara = ANY($2))
+        `,
+        [id_cc, camaras]
+    );
     return result.rows;
 };
+
+// Clientes que SÍ tienen fruta en cámara. Alimenta el dropdown del
+// despacho en lugar del catálogo completo.
+//
+// El agregado se recalcula aquí (en vez de leer vw_clientes_con_inventario)
+// porque esa vista agrupa TODO el inventario: si se leyera tal cual, un
+// supervisor vería clientes cuya fruta está en cámaras ajenas y luego no
+// encontraría nada al armar el picking.
+const getClientesConInventario = async (camaras = null) => {
+    const result = await db.query(
+        `
+        SELECT
+            id_cc,
+            cliente,
+            cedis,
+            acronimo_cc,
+            COUNT(*)                 AS procesos,
+            SUM(tarimas_disponibles) AS tarimas_disponibles,
+            SUM(cajas_disponibles)   AS cajas_disponibles,
+            MIN(fecha_entrega)       AS fecha_entrega_proxima,
+            MIN(fecha_empaque)       AS fecha_empaque_mas_antigua
+        FROM vw_inventario_disponible
+        WHERE id_cc IS NOT NULL
+          AND ($1::INT[] IS NULL OR id_camara = ANY($1))
+        GROUP BY id_cc, cliente, cedis, acronimo_cc
+        ORDER BY cliente, cedis
+        `,
+        [camaras]
+    );
+    return result.rows;
+};
+
 
 // ---------------------------------------------------------
 // CONSULTAS DE DESPACHOS
@@ -104,7 +138,7 @@ const getPickingList = async (id_despacho) => {
     return await getDespachoConDetalle(id_despacho);
 };
 
-// Siguiente folio (D-AAAA-NNNN).
+// Siguiente folio (numeración de negocio desde 70000).
 // OJO: consume la secuencia, llamar solo al abrir el modal de alta.
 const getSiguienteFolio = async () => {
     const result = await db.query(`SELECT fn_generar_folio_despacho() AS folio`);
@@ -115,7 +149,6 @@ const getSiguienteFolio = async () => {
 // ---------------------------------------------------------
 // CREAR DESPACHO (+ detalle opcional, en transacción)
 // ---------------------------------------------------------
-// body = { ...encabezado, detalle: [ { id_ocupacion_origen, cantidad_tarimas, ... } ] }
 // El folio se autogenera si no se envía.
 // Los totales y los movimientos los generan los triggers.
 const createDespacho = async ({
@@ -281,9 +314,29 @@ const deleteDetalle = async (id_detalle) => {
     return result.rows[0]?.resultado;
 };
 
+// Cámara de origen de una línea. Sirve para validar alcance antes de
+// permitir que alguien quite fruta de una cámara ajena.
+const getCamaraDeDetalle = async (id_detalle) => {
+    const result = await db.query(
+        `SELECT id_camara_origen FROM despachos_detalle WHERE id_detalle = $1`,
+        [id_detalle]
+    );
+    return result.rows[0]?.id_camara_origen ?? null;
+};
+
+// Cámara de una ocupación. Se usa al agregar una línea cuando el body
+// solo trae id_ocupacion_origen.
+const getCamaraDeOcupacion = async (id_ocupacion) => {
+    const result = await db.query(
+        `SELECT id_camara FROM ocupaciones_camaras WHERE id_ocupacion = $1`,
+        [id_ocupacion]
+    );
+    return result.rows[0]?.id_camara ?? null;
+};
+
 
 // ---------------------------------------------------------
-// ACTUALIZAR / CERRAR / CANCELAR
+// ACTUALIZAR / CERRAR
 // ---------------------------------------------------------
 // Actualiza el encabezado. No toca cantidades (las lleva el trigger).
 // El folio tampoco se modifica: es inmutable una vez asignado.
@@ -336,6 +389,48 @@ const updateDespacho = async (
     return result.rows[0];
 };
 
+// Edición limitada para despachos CERRADOS.
+// Solo datos administrativos: nunca el cliente ni el picking, porque eso
+// cambiaría a quién se despachó o qué fruta salió.
+const updateDespachoCerrado = async (
+    id_despacho,
+    {
+        id_transporte,
+        orden_venta,
+        cita,
+        fecha_cita,
+        hora_salida,
+        temperatura_salida,
+        observaciones
+    }
+) => {
+    const result = await db.query(
+        `
+        UPDATE despachos
+        SET id_transporte      = COALESCE($1, id_transporte),
+            orden_venta        = COALESCE($2, orden_venta),
+            cita               = COALESCE($3, cita),
+            fecha_cita         = COALESCE($4, fecha_cita),
+            hora_salida        = COALESCE($5, hora_salida),
+            temperatura_salida = COALESCE($6, temperatura_salida),
+            observaciones      = COALESCE($7, observaciones)
+        WHERE id_despacho = $8
+        RETURNING *
+        `,
+        [
+            id_transporte ?? null,
+            orden_venta ?? null,
+            cita ?? null,
+            fecha_cita ?? null,
+            hora_salida ?? null,
+            temperatura_salida ?? null,
+            observaciones ?? null,
+            id_despacho
+        ]
+    );
+    return result.rows[0];
+};
+
 // Cerrar el despacho (estado = 2). Solo procede si está en borrador.
 // A partir de aquí el picking queda congelado.
 const cerrarDespacho = async (
@@ -363,17 +458,9 @@ const cerrarDespacho = async (
     return result.rows[0];
 };
 
-const cancelarDespacho = async (id_despacho) => {
-    const result = await db.query(
-        `UPDATE despachos SET estado = 0 WHERE id_despacho = $1 RETURNING *`,
-        [id_despacho]
-    );
-    return result.rows[0];
-};
-
 // Eliminar despacho.
 // Antes de borrar, devuelve a las cámaras el producto de cada línea
-// (usando la misma función de reversa), para no dejar inventario perdido.
+// (con la misma función de reversa), para no dejar inventario perdido.
 const deleteDespacho = async (id_despacho) => {
     const client = await db.connect();
     try {
@@ -405,6 +492,14 @@ const deleteDespacho = async (id_despacho) => {
     }
 };
 
+
+// ---------------------------------------------------------
+// AUDITORÍA DE EDICIONES
+// ---------------------------------------------------------
+// Un despacho cerrado no se elimina, pero sí admite corregir datos
+// administrativos (placas mal escritas, orden de venta que llegó tarde).
+// Cada corrección exige motivo y queda registrada: si después hay un
+// reclamo, aquí está el rastro de quién cambió qué y por qué.
 const registrarAuditoria = async ({
     id_despacho,
     estado_al_editar,
@@ -431,7 +526,6 @@ const registrarAuditoria = async ({
     return result.rows[0];
 };
 
-// Historial de ediciones de un despacho
 const getAuditoria = async (id_despacho) => {
     const result = await db.query(
         `SELECT * FROM vw_despachos_auditoria WHERE id_despacho = $1`,
@@ -440,46 +534,12 @@ const getAuditoria = async (id_despacho) => {
     return result.rows;
 };
 
-// Edición limitada para despachos CERRADOS.
-// Solo datos administrativos: nunca el cliente ni el picking, porque
-// eso cambiaría a quién se despachó o qué fruta salió.
-const updateDespachoCerrado = async (
-    id_despacho,
-    { id_transporte, orden_venta, cita, fecha_cita, hora_salida,
-      temperatura_salida, observaciones }
-) => {
-    const result = await db.query(
-        `
-        UPDATE despachos
-        SET id_transporte      = COALESCE($1, id_transporte),
-            orden_venta        = COALESCE($2, orden_venta),
-            cita               = COALESCE($3, cita),
-            fecha_cita         = COALESCE($4, fecha_cita),
-            hora_salida        = COALESCE($5, hora_salida),
-            temperatura_salida = COALESCE($6, temperatura_salida),
-            observaciones      = COALESCE($7, observaciones)
-        WHERE id_despacho = $8
-        RETURNING *
-        `,
-        [
-            id_transporte ?? null,
-            orden_venta ?? null,
-            cita ?? null,
-            fecha_cita ?? null,
-            hora_salida ?? null,
-            temperatura_salida ?? null,
-            observaciones ?? null,
-            id_despacho
-        ]
-    );
-    return result.rows[0];
-};
-
 
 const despachosModel = {
     // inventario
     getInventarioDisponible,
     getInventarioByCliente,
+    getClientesConInventario,
     // consultas
     getDespachos,
     getDespachoById,
@@ -490,17 +550,19 @@ const despachosModel = {
     // altas
     createDespacho,
     addDetalle,
+    // alcance
+    getCamaraDeDetalle,
+    getCamaraDeOcupacion,
     // bajas
     deleteDetalle,
     deleteDespacho,
     // cambios de estado
     updateDespacho,
+    updateDespachoCerrado,
     cerrarDespacho,
-    cancelarDespacho,
-    getClientesConInventario,
+    // auditoría
     registrarAuditoria,
-    getAuditoria,
-    updateDespachoCerrado
+    getAuditoria
 };
 
 export default despachosModel;

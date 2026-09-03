@@ -1,14 +1,61 @@
 import despachosModel from "../models/despachos.model.js";
 
+// ============================================================================
+// DESPACHOS
+// ============================================================================
+// ALCANCE POR CÁMARA
+//   req.camaras lo pone el middleware cargarAlcance:
+//       null  -> Admin / Coordinador (ven todo)
+//       [...] -> Supervisor / Operativo (solo sus cámaras)
+//
+//   Se filtra el INVENTARIO (de dónde se puede tomar fruta), no la lista de
+//   despachos: un despacho es un documento comercial que puede llevar carga
+//   de varias plantas, y recortarlo daría totales incompletos. Lo que
+//   protege el inventario es acotar el picking, y eso sí se hace.
+// ============================================================================
+
+const sinAcceso = (req, id_camara) =>
+    Array.isArray(req.camaras) && !req.camaras.includes(Number(id_camara));
+
+// Campos que se pueden corregir en un despacho ya cerrado.
+// Se declaran aquí para generar el resumen de cambios de la auditoría.
+const CAMPOS_AUDITABLES = {
+    id_transporte: "Transporte",
+    orden_venta: "Orden de venta",
+    cita: "Cita",
+    fecha_cita: "Fecha de cita",
+    hora_salida: "Hora de salida",
+    temperatura_salida: "Temperatura de salida",
+    observaciones: "Observaciones"
+};
+
+// Compara antes/después y deja constancia legible de qué cambió.
+// Ej: 'Transporte: 3 → 5; Placas: 15AN7H → 15AN8J'
+const construirCambios = (antes, despues) => {
+    const lista = [];
+    for (const [campo, etiqueta] of Object.entries(CAMPOS_AUDITABLES)) {
+        const valAntes = antes?.[campo];
+        const valDespues = despues?.[campo];
+        if (
+            valDespues !== undefined &&
+            valDespues !== null &&
+            String(valAntes ?? "") !== String(valDespues ?? "")
+        ) {
+            lista.push(`${etiqueta}: ${valAntes ?? "—"} → ${valDespues}`);
+        }
+    }
+    return lista.join("; ").substring(0, 1000);
+};
+
+
 // =========================================================
 // INVENTARIO DISPONIBLE (para armar el picking)
 // =========================================================
 
 // GET /api/preenfrio/despachos/inventario
-// Muestra TODO lo que hay en cámaras (preenfrío y conserva), FEFO.
 const getInventarioDisponible = async (req, res) => {
     try {
-        const data = await despachosModel.getInventarioDisponible();
+        const data = await despachosModel.getInventarioDisponible(req.camaras);
         res.status(200).json(data);
     } catch (error) {
         console.error("Error al obtener inventario disponible:", error);
@@ -27,7 +74,10 @@ const getInventarioByCliente = async (req, res) => {
                 error: "El id de cliente debe ser un número válido"
             });
         }
-        const data = await despachosModel.getInventarioByCliente(id_cc);
+        const data = await despachosModel.getInventarioByCliente(
+            id_cc,
+            req.camaras
+        );
         res.status(200).json(data);
     } catch (error) {
         console.error("Error al obtener inventario del cliente:", error);
@@ -37,10 +87,12 @@ const getInventarioByCliente = async (req, res) => {
     }
 };
 
-// Solo clientes con producto disponible en cámaras.
+// GET /api/preenfrio/despachos/clientes
+// Solo clientes con producto disponible EN SUS CÁMARAS: ofrecer un cliente
+// cuya fruta está en otra planta llevaría a un picking vacío.
 const getClientesConInventario = async (req, res) => {
     try {
-        const data = await despachosModel.getClientesConInventario();
+        const data = await despachosModel.getClientesConInventario(req.camaras);
         res.status(200).json(data);
     } catch (error) {
         console.error("Error al obtener clientes con inventario:", error);
@@ -49,6 +101,7 @@ const getClientesConInventario = async (req, res) => {
         });
     }
 };
+
 
 // =========================================================
 // CONSULTAS DE DESPACHOS
@@ -156,6 +209,25 @@ const getSiguienteFolio = async (req, res) => {
     }
 };
 
+// GET /api/preenfrio/despachos/auditoria/:id_despacho
+const getAuditoria = async (req, res) => {
+    try {
+        const { id_despacho } = req.params;
+        if (!id_despacho || isNaN(Number(id_despacho))) {
+            return res.status(400).json({
+                error: "El id de despacho debe ser un número válido"
+            });
+        }
+        const data = await despachosModel.getAuditoria(id_despacho);
+        res.status(200).json(data);
+    } catch (error) {
+        console.error("Error al obtener la auditoría:", error);
+        res.status(500).json({
+            error: "Error al obtener el historial de cambios"
+        });
+    }
+};
+
 
 // =========================================================
 // ALTAS
@@ -166,6 +238,24 @@ const getSiguienteFolio = async (req, res) => {
 // (lo valida el middleware) porque el picking list lo imprime.
 const createDespacho = async (req, res) => {
     try {
+        // Si viene con detalle, se valida que TODAS las líneas salgan de
+        // cámaras propias antes de tocar nada.
+        if (Array.isArray(req.camaras) && Array.isArray(req.body.detalle)) {
+            for (const linea of req.body.detalle) {
+                let cam = linea.id_camara_origen;
+                if (!cam && linea.id_ocupacion_origen) {
+                    cam = await despachosModel.getCamaraDeOcupacion(
+                        Number(linea.id_ocupacion_origen)
+                    );
+                }
+                if (cam && sinAcceso(req, cam)) {
+                    return res.status(403).json({
+                        error: "No tienes acceso a una de las cámaras del picking"
+                    });
+                }
+            }
+        }
+
         const nuevoDespacho = await despachosModel.createDespacho(req.body);
         res.status(201).json(nuevoDespacho);
     } catch (error) {
@@ -181,7 +271,9 @@ const createDespacho = async (req, res) => {
             });
         }
         res.status(500).json({
-            error: "Error al crear el despacho"
+            error:
+                "Error al crear el despacho" +
+                (error.message ? `: ${error.message}` : "")
         });
     }
 };
@@ -204,6 +296,21 @@ const addDetalle = async (req, res) => {
             });
         }
 
+        // Alcance: la fruta debe salir de una cámara propia
+        if (Array.isArray(req.camaras)) {
+            let cam = req.body.id_camara_origen;
+            if (!cam && req.body.id_ocupacion_origen) {
+                cam = await despachosModel.getCamaraDeOcupacion(
+                    Number(req.body.id_ocupacion_origen)
+                );
+            }
+            if (cam && sinAcceso(req, cam)) {
+                return res.status(403).json({
+                    error: "No tienes acceso a esa cámara"
+                });
+            }
+        }
+
         const linea = await despachosModel.addDetalle(id, req.body);
         res.status(201).json(linea);
     } catch (error) {
@@ -214,17 +321,24 @@ const addDetalle = async (req, res) => {
             });
         }
         res.status(500).json({
-            error: "Error al agregar el detalle del despacho"
+            error:
+                "Error al agregar el detalle del despacho" +
+                (error.message ? `: ${error.message}` : "")
         });
     }
 };
 
 
 // =========================================================
-// BAJAS Y CAMBIOS DE ESTADO
+// EDICIÓN Y CAMBIOS DE ESTADO
 // =========================================================
 
 // PUT /api/preenfrio/despachos/actualizardespacho/:id
+//
+// Comportamiento según el estado:
+//   BORRADOR → edición libre (aún no sale el camión).
+//   CERRADO  → solo datos administrativos y con MOTIVO obligatorio.
+//              Se registra en la bitácora de auditoría.
 const updateDespacho = async (req, res) => {
     try {
         const { id } = req.params;
@@ -238,13 +352,6 @@ const updateDespacho = async (req, res) => {
         const estado = Number(actual.estado);
         const id_usuario =
             req.id_usuario ?? req.usuario?.id_usuario ?? null;
-
-        // ---- Cancelado: no se toca ----
-        if (estado === 0) {
-            return res.status(409).json({
-                error: "Un despacho cancelado no se puede editar"
-            });
-        }
 
         // ---- Cerrado: edición limitada + auditoría ----
         if (estado === 2) {
@@ -263,7 +370,10 @@ const updateDespacho = async (req, res) => {
                 });
             }
 
-            const actualizado = await despachosModel.updateDespachoCerrado(id, req.body);
+            const actualizado = await despachosModel.updateDespachoCerrado(
+                id,
+                req.body
+            );
 
             await despachosModel.registrarAuditoria({
                 id_despacho: Number(id),
@@ -301,7 +411,9 @@ const updateDespacho = async (req, res) => {
                 error: "El transporte o cliente indicado no existe"
             });
         }
-        res.status(500).json({ error: "Error al actualizar el despacho" });
+        res.status(500).json({
+            error: "Error al actualizar el despacho"
+        });
     }
 };
 
@@ -326,30 +438,27 @@ const cerrarDespacho = async (req, res) => {
     }
 };
 
-// PATCH /api/preenfrio/despachos/cancelardespacho/:id
-const cancelarDespacho = async (req, res) => {
-    try {
-        const { id } = req.params;
-        const cancelado = await despachosModel.cancelarDespacho(id);
-        if (!cancelado) {
-            return res.status(404).json({ error: "Despacho no encontrado" });
-        }
-        res.status(200).json({
-            mensaje: "Despacho cancelado correctamente",
-            aviso: "Las líneas del picking NO se revirtieron: quítalas una por una si necesitas devolver la fruta a las cámaras.",
-            despacho: cancelado
-        });
-    } catch (error) {
-        console.error("Error al cancelar despacho:", error);
-        res.status(500).json({ error: "Error al cancelar el despacho" });
-    }
-};
+
+// =========================================================
+// BAJAS
+// =========================================================
 
 // DELETE /api/preenfrio/despachos/detalle/:id_detalle
 // Devuelve el producto a la cámara y borra el movimiento asociado.
 const deleteDetalle = async (req, res) => {
     try {
         const { id_detalle } = req.params;
+
+        // Alcance: no se quita fruta de una cámara ajena
+        if (Array.isArray(req.camaras)) {
+            const cam = await despachosModel.getCamaraDeDetalle(id_detalle);
+            if (cam !== null && sinAcceso(req, cam)) {
+                return res.status(403).json({
+                    error: "No tienes acceso a esa cámara"
+                });
+            }
+        }
+
         const resultado = await despachosModel.deleteDetalle(id_detalle);
 
         // La función de BD devuelve texto: 'OK: ...' o el motivo del rechazo
@@ -368,7 +477,10 @@ const deleteDetalle = async (req, res) => {
 };
 
 // DELETE /api/preenfrio/despachos/eliminardespacho/:id
-// Devuelve a las cámaras todo el producto del picking antes de borrar.
+//
+// Solo se eliminan BORRADORES: nunca salieron, la fruta sigue en cámara.
+// Un despacho cerrado no se borra (el camión ya salió); si hay que anularlo
+// o devolver producto, corresponde una devolución.
 const deleteDespacho = async (req, res) => {
     try {
         const { id } = req.params;
@@ -379,7 +491,7 @@ const deleteDespacho = async (req, res) => {
         }
         if (Number(actual.estado) !== 1) {
             return res.status(409).json({
-                error: "Solo se pueden eliminar despachos en borrador. Un despacho cerrado ya salió: si necesitas anularlo, cancélalo."
+                error: "Solo se pueden eliminar despachos en borrador. Un despacho cerrado ya salió: si necesitas devolver producto, registra una devolución."
             });
         }
 
@@ -395,56 +507,18 @@ const deleteDespacho = async (req, res) => {
                 error: "No se puede eliminar: el despacho está referenciado en movimientos de inventario"
             });
         }
-        res.status(500).json({ error: "Error al eliminar el despacho" });
+        res.status(500).json({
+            error: "Error al eliminar el despacho"
+        });
     }
 };
 
-const CAMPOS_AUDITABLES = {
-    id_transporte: "Transporte",
-    orden_venta: "Orden de venta",
-    cita: "Cita",
-    fecha_cita: "Fecha de cita",
-    hora_salida: "Hora de salida",
-    temperatura_salida: "Temperatura de salida",
-    observaciones: "Observaciones"
-};
-
-const construirCambios = (antes, despues) => {
-    const lista = [];
-    for (const [campo, etiqueta] of Object.entries(CAMPOS_AUDITABLES)) {
-        const valAntes = antes?.[campo];
-        const valDespues = despues?.[campo];
-        if (
-            valDespues !== undefined &&
-            valDespues !== null &&
-            String(valAntes ?? "") !== String(valDespues ?? "")
-        ) {
-            lista.push(`${etiqueta}: ${valAntes ?? "—"} → ${valDespues}`);
-        }
-    }
-    return lista.join("; ").substring(0, 1000);
-};
-
-const getAuditoria = async (req, res) => {
-    try {
-        const { id_despacho } = req.params;
-        if (!id_despacho || isNaN(Number(id_despacho))) {
-            return res.status(400).json({
-                error: "El id de despacho debe ser un número válido"
-            });
-        }
-        const data = await despachosModel.getAuditoria(id_despacho);
-        res.status(200).json(data);
-    } catch (error) {
-        console.error("Error al obtener la auditoría:", error);
-        res.status(500).json({ error: "Error al obtener el historial de cambios" });
-    }
-};
 
 export const despachosController = {
     // inventario
     getInventarioDisponible,
     getInventarioByCliente,
+    getClientesConInventario,
     // consultas
     getDespachos,
     getDespachoById,
@@ -452,15 +526,13 @@ export const despachosController = {
     getDespachosByEstado,
     getPickingList,
     getSiguienteFolio,
+    getAuditoria,
     // altas
     createDespacho,
     addDetalle,
     // bajas / estados
     updateDespacho,
     cerrarDespacho,
-    cancelarDespacho,
     deleteDetalle,
-    deleteDespacho,
-    getClientesConInventario,
-    getAuditoria
+    deleteDespacho
 };

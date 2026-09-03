@@ -1,13 +1,13 @@
 import { db } from "../database/connection.database.js";
 
-// =========================================================
+// ============================================================================
 // MOVIMIENTOS DE INVENTARIO
-// =========================================================
+// ============================================================================
 // NOTA DE DISEÑO
 //   Al INSERTAR, el trigger trg_sync_ocupacion_movimiento actualiza
 //   ocupaciones_camaras (descuenta origen / suma destino). Por eso los
-//   movimientos son bitácora inmutable: GET, POST y DELETE, pero NO
-//   update (un cambio posterior descuadraría las ocupaciones).
+//   movimientos son bitácora inmutable: GET, POST y DELETE, pero NO update
+//   (un cambio posterior descuadraría las ocupaciones ya sincronizadas).
 //
 //   tipo_movimiento: 1=ingreso_preenfrio · 2=preenfrio_a_conserva
 //                    3=salida_despacho
@@ -19,22 +19,35 @@ import { db } from "../database/connection.database.js";
 //                          tiene varios procesos conviviendo.
 //
 // ⚠️ SIN 'lotes'
-//   La tabla lotes se eliminó del esquema: el código de lote vive en
-//   produccion.codigo_lote. Este modelo NO debe referenciar id_lote ni
-//   hacer JOIN a lotes; hacerlo rompe el INSERT con error 42703.
-//   Las lecturas usan la vista vw_movimientos, que ya resuelve nombres
-//   de cámaras, folio de despacho, lote, finca, SKU, cliente y usuario.
-// =========================================================
+//   La tabla lotes se eliminó: el código de lote vive en
+//   produccion.codigo_lote. Este modelo NO debe referenciar id_lote.
+//
+// ALCANCE POR CÁMARA
+//   Un movimiento toca DOS cámaras (origen y destino). Basta con que UNA
+//   esté en el alcance del usuario para que pueda verlo: si movió fruta de
+//   su preenfrío a una conserva ajena, ese movimiento le concierne.
+// ============================================================================
 
 
 // ---------------------------------------------------------
 // CONSULTAS
 // ---------------------------------------------------------
-const getMovimientos = async () => {
-    const result = await db.query(`SELECT * FROM vw_movimientos`);
+const getMovimientos = async (camaras = null) => {
+    const result = await db.query(
+        `
+        SELECT * FROM vw_movimientos
+        WHERE ($1::INT[] IS NULL
+               OR id_camara_origen = ANY($1)
+               OR id_camara_destino = ANY($1))
+        `,
+        [camaras]
+    );
     return result.rows;
 };
 
+// Un movimiento por ID.
+// No filtra: el controller compara las cámaras del resultado para poder
+// distinguir "no existe" (404) de "no tienes acceso" (403).
 const getMovimientoById = async (id_movimiento) => {
     const result = await db.query(
         `SELECT * FROM vw_movimientos WHERE id_movimiento = $1`,
@@ -44,22 +57,31 @@ const getMovimientoById = async (id_movimiento) => {
 };
 
 // Trazabilidad del proceso: todos sus movimientos en orden cronológico
-const getMovimientosByProduccion = async (id_produccion) => {
+const getMovimientosByProduccion = async (id_produccion, camaras = null) => {
     const result = await db.query(
         `
         SELECT * FROM vw_movimientos
         WHERE id_produccion = $1
+          AND ($2::INT[] IS NULL
+               OR id_camara_origen = ANY($2)
+               OR id_camara_destino = ANY($2))
         ORDER BY fecha_movimiento ASC, hora_movimiento ASC
         `,
-        [id_produccion]
+        [id_produccion, camaras]
     );
     return result.rows;
 };
 
-const getMovimientosByTipo = async (tipo_movimiento) => {
+const getMovimientosByTipo = async (tipo_movimiento, camaras = null) => {
     const result = await db.query(
-        `SELECT * FROM vw_movimientos WHERE tipo_movimiento = $1`,
-        [tipo_movimiento]
+        `
+        SELECT * FROM vw_movimientos
+        WHERE tipo_movimiento = $1
+          AND ($2::INT[] IS NULL
+               OR id_camara_origen = ANY($2)
+               OR id_camara_destino = ANY($2))
+        `,
+        [tipo_movimiento, camaras]
     );
     return result.rows;
 };
@@ -77,10 +99,16 @@ const getMovimientosByCamara = async (id_camara) => {
 };
 
 // Movimientos ligados a un despacho (salidas tipo 3)
-const getMovimientosByDespacho = async (id_despacho) => {
+const getMovimientosByDespacho = async (id_despacho, camaras = null) => {
     const result = await db.query(
-        `SELECT * FROM vw_movimientos WHERE id_despacho = $1`,
-        [id_despacho]
+        `
+        SELECT * FROM vw_movimientos
+        WHERE id_despacho = $1
+          AND ($2::INT[] IS NULL
+               OR id_camara_origen = ANY($2)
+               OR id_camara_destino = ANY($2))
+        `,
+        [id_despacho, camaras]
     );
     return result.rows;
 };
@@ -163,6 +191,16 @@ const deleteMovimiento = async (id_movimiento) => {
     return result.rows[0];
 };
 
+// Cámara origen de una ocupación. Sirve para validar el alcance cuando el
+// body trae id_ocupacion_origen pero no la cámara.
+const getCamaraDeOcupacion = async (id_ocupacion) => {
+    const result = await db.query(
+        `SELECT id_camara FROM ocupaciones_camaras WHERE id_ocupacion = $1`,
+        [id_ocupacion]
+    );
+    return result.rows[0]?.id_camara ?? null;
+};
+
 
 const movimientosInventarioModel = {
     getMovimientos,
@@ -171,6 +209,7 @@ const movimientosInventarioModel = {
     getMovimientosByTipo,
     getMovimientosByCamara,
     getMovimientosByDespacho,
+    getCamaraDeOcupacion,
     createMovimiento,
     deleteMovimiento
 };
